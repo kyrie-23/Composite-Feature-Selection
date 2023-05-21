@@ -97,7 +97,7 @@ class SingleFeatureSelector(nn.Module):
     def __init__(self, in_dim, h_dim, out_dim, threshold_func, temp):
         super(SingleFeatureSelector, self).__init__()
         self.to_hidden = FullyConnected(in_dim, h_dim)
-        self.gate = Gate(in_dim, threshold_func, temp)      
+        self.gate = Gate(in_dim, threshold_func, temp)
         self.fc_individual = nn.Linear(h_dim, out_dim)
         self.fc_aggregate = nn.Linear(h_dim, out_dim)
 
@@ -167,13 +167,10 @@ class CompFS(nn.Module):
 
     def forward(self, x):
         x_b = self.x_bar.repeat(len(x), 1).to(x.device)
-        x_ = torch.split(x, 163, dim=1)
-        x_b = torch.split(x_b, 163, dim=1)
         total = 0
         individuals = torch.tensor([]).to(x.device)
-        for i in range(self.nlearners):
-            learner = self.learners[i]
-            hidden = learner(x_[i], x_b[i]).unsqueeze(0)
+        for learner in self.learners:
+            hidden = learner(x, x_b).unsqueeze(0)
             total += learner.fc_aggregate(hidden)
             individuals = torch.cat(
                 [individuals, learner.fc_individual(hidden.detach())],
@@ -188,12 +185,9 @@ class CompFS(nn.Module):
     def predict(self, x):
         # Test the ensemble.
         x_b = self.x_bar.repeat(len(x), 1).to(x.device)
-        x_ = torch.split(x, 163, dim=1)
-        x_b = torch.split(x_b, 163, dim=1)
         out = 0
-        for i in range(self.nlearners):
-            learner = self.learners[i]
-            out += learner.fc_aggregate(learner(x_[i], x_b[i], test=True))
+        for learner in self.learners:
+            out += learner.fc_aggregate(learner(x, x_b, test=True))
         return out
 
     def preprocess(self, data):
@@ -273,12 +267,10 @@ class CompFS(nn.Module):
         )
 
         # print individual accuracies if using compfs
-        x_ = torch.split(x, 163, dim=1)
-        x_b = torch.split(self.x_bar, 163, dim=0)
         for i in range(self.nlearners):
             output = self.learners[i].predict(
-                x_[i],
-                x_b[i].repeat(len(x_[i]), 1).to(x.device),
+                x,
+                self.x_bar.repeat(len(x), 1).to(x.device),
             )
             individual_performance = val_metric(output, y)
             np.save(

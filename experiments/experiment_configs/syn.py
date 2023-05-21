@@ -33,7 +33,7 @@ default_config = {
                 "num_epochs": 35,
                 "loss_func": nn.CrossEntropyLoss(),
                 "val_metric": metrics.accuracy,
-                "in_dim": 500,
+                "in_dim": 100,
                 "h_dim": 20,
                 "out_dim": 2,
                 "nlearners": 5,
