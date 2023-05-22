@@ -97,16 +97,17 @@ class SingleFeatureSelector(nn.Module):
     def __init__(self, in_dim, h_dim, out_dim, threshold_func, temp):
         super(SingleFeatureSelector, self).__init__()
         self.to_hidden = FullyConnected(in_dim, h_dim)
-        self.decoder = nn.Linear(h_dim, in_dim)
-        self.gate = Gate(in_dim, threshold_func, temp)      
+        self.decoder_x = nn.Linear(h_dim, in_dim)
+        self.decoder_m = nn.Linear(h_dim, in_dim)
+        self.gate = Gate(in_dim, threshold_func, temp)
         self.fc_individual = nn.Linear(h_dim, out_dim)
         self.fc_aggregate = nn.Linear(h_dim, out_dim)
 
     def forward(self, x, x_bar=0, test=False):
         return self.to_hidden(self.gate(x, x_bar, test))
 
-    def decode(self, x, x_bar):
-        return self.decoder(self.forward(x, x_bar, test=True))
+    def encode(self, x):
+        return self.to_hidden(x)
 
     def predict(self, x, x_bar):
         return self.fc_individual(self.forward(x, x_bar, test=True))
@@ -121,7 +122,7 @@ class SingleFeatureSelector(nn.Module):
 
     def get_importance(self):
         # Frobenius norm of final weight matrix, to compare to other learners.
-        return torch.sqrt(torch.sum(self.fc_aggregate.weight**2)).item()
+        return torch.sqrt(torch.sum(self.fc_aggregate.weight ** 2)).item()
 
 
 class CompFS(nn.Module):
@@ -149,7 +150,7 @@ class CompFS(nn.Module):
         self.beta_d = config_dict["beta_d"]
         self.beta_d_decay = config_dict["beta_d_decay"]
         self.loss_func = config_dict["loss_func"]
-        self.x_bar = 0
+        self.x_bar = []
         self.nfeatures = config_dict["in_dim"]
         self.nlearners = config_dict["nlearners"]
         h_dim = config_dict["h_dim"]
@@ -159,7 +160,7 @@ class CompFS(nn.Module):
         self.learners = nn.ModuleList(
             [
                 SingleFeatureSelector(
-                    self.nfeatures,
+                    self.nfeatures[_],
                     h_dim,
                     out_dim,
                     threshold_func,
@@ -170,42 +171,51 @@ class CompFS(nn.Module):
         )
 
     def forward(self, x):
-        x_b = self.x_bar.repeat(len(x), 1).to(x.device)
-        x_ = torch.split(x, 163, dim=1)
-        x_b = torch.split(x_b, 163, dim=1)
+        x_b = []
         total = 0
-        individuals = torch.tensor([]).to(x.device)
-        for i in range(self.nlearners):
-            learner = self.learners[i]
-            hidden = learner(x_[i], x_b[i]).unsqueeze(0)
-            total += learner.fc_aggregate(hidden)
+        individuals = torch.tensor([]).to(x[0].device)
+        for l in range(self.nlearners):
+            x_b.append(self.x_bar[l].repeat(len(x[l]), 1).to(x[l].device))
+            hidden = self.learners[l](x[l], x_b[l]).unsqueeze(0)
+            total += self.learners[l].fc_aggregate(hidden)
             individuals = torch.cat(
-                [individuals, learner.fc_individual(hidden.detach())],
-                dim=0,
+                [individuals, self.learners[l].fc_individual(hidden.detach())], dim=0
             )
         out = torch.cat(
-            [total, individuals],
-            dim=0,
+            [total, individuals], dim=0
         )  # We want to train the ensemble, and the individual learners together.
         return out
 
     def predict(self, x):
         # Test the ensemble.
-        x_b = self.x_bar.repeat(len(x), 1).to(x.device)
-        x_ = torch.split(x, 163, dim=1)
-        x_b = torch.split(x_b, 163, dim=1)
+        x_b = []
         out = 0
-        for i in range(self.nlearners):
-            learner = self.learners[i]
-            out += learner.fc_aggregate(learner(x_[i], x_b[i], test=True))
+        for l in range(self.nlearners):
+            x_b.append(self.x_bar[l].repeat(len(x[l]), 1).to(x[l].device))
+            out += self.learners[l].fc_aggregate(self.learners[l](x[l], x_b[l], test=True))
         return out
 
     def preprocess(self, data):
         return data
 
-    def ss_phase(self, x):
-
-
+    def ss_phase(self, x, m):
+        loss = 0
+        x_b = []
+        for i in range(self.nlearners):
+            learner = self.learners[i]
+            x_b.append(self.x_bar[i].repeat(len(x[i]), 1).to(x[i].device))
+            x_tilde = x[i] * m[i] + x_b[i] * (1 - m[i])
+            m_tilde = torch.eq(x[i], x_tilde).to(torch.float32)
+            encode = learner.encode(x_tilde)
+            decode_x = learner.decoder_x(encode)
+            decode_m = learner.decoder_m(encode)
+            loss += F.mse_loss(decode_x, x[i])
+            loss += torch.mean(
+                -torch.sum(m_tilde * torch.log(decode_m) + (1 - m_tilde) * torch.log(1 - decode_m), dim=1))
+            regularization_loss = 0
+            for param in learner.parameters():
+                regularization_loss += torch.sum(abs(param))
+        return loss + regularization_loss
 
     def get_loss(self, x, y):
         output = self.forward(x)
@@ -215,20 +225,20 @@ class CompFS(nn.Module):
             pi_i = torch.sigmoid(self.learners[i].gate.w)
             # Multiply by square root of number of features. So we punish more features, but not as quickly as linearly.
             loss += (
-                self.beta_s
-                * (torch.mean(pi_i) ** 2)
-                * (self.nfeatures**0.5)
-                / (self.nlearners)
+                    self.beta_s
+                    * (torch.mean(pi_i) ** 2)
+                    * (self.nfeatures[i] ** 0.5)
+                    / (self.nlearners)
             )
-            for j in range(i + 1, self.nlearners):
-                pi_j = torch.sigmoid(self.learners[j].gate.w)
-                loss += (
-                    2
-                    * self.beta_d
-                    * torch.mean(pi_i * pi_j)
-                    * (self.nfeatures**0.5)
-                    / (self.nlearners * (self.nlearners - 1))
-                )
+            # for j in range(i + 1, self.nlearners):
+            #     pi_j = torch.sigmoid(self.learners[j].gate.w)
+            #     loss += (
+            #         2
+            #         * self.beta_d
+            #         * torch.mean(pi_i * pi_j)
+            #         * (self.nfeatures**0.5)
+            #         / (self.nlearners * (self.nlearners - 1))
+            #     )
         return loss
 
     def update_after_epoch(self):
@@ -281,12 +291,10 @@ class CompFS(nn.Module):
         )
 
         # print individual accuracies if using compfs
-        x_ = torch.split(x, 163, dim=1)
-        x_b = torch.split(self.x_bar, 163, dim=0)
         for i in range(self.nlearners):
             output = self.learners[i].predict(
-                x_[i],
-                x_b[i].repeat(len(x_[i]), 1).to(x.device),
+                x[i],
+                self.x_bar[i].repeat(len(x[i]), 1).to(x[i].device),
             )
             individual_performance = val_metric(output, y)
             np.save(
